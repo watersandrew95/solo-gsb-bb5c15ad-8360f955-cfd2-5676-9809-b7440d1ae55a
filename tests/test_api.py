@@ -2750,17 +2750,148 @@ def test_backup_leaves_no_visible_file_when_publish_fails(backup_client, monkeyp
     from app import backup as backup_module
 
     _seed_site(backup_client)
-    real_replace = os.replace
+    real_link = os.link
 
     def boom(src, dst):
         raise OSError("simulated publish failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(backup_module.os, "replace", boom)
+        patch.setattr(backup_module.os, "link", boom)
         resp = client_post(backup_client, BACKUP_TOKEN)
     assert resp.status_code == 500
     assert list(Path(os.environ["IMD_BACKUP_DIR"]).iterdir()) == []
-    assert real_replace is os.replace
+    assert real_link is os.link
+
+
+def test_backup_publish_retries_new_name_instead_of_overwriting(
+    backup_client, monkeypatch
+):
+    import hashlib
+    from pathlib import Path
+
+    from app import backup as backup_module
+
+    _seed_site(backup_client)
+    first = client_post(backup_client, BACKUP_TOKEN).json()
+    bdir = Path(os.environ["IMD_BACKUP_DIR"])
+    first_path = bdir / first["filename"]
+    first_bytes = first_path.read_bytes()  # 既有快照内容
+
+    # 强制下一次发布的首个候选与既有快照同名：必须换名重试而非覆盖。
+    real_final_name = backup_module._final_name
+    collision_returned = False
+
+    def candidate(now=None):
+        nonlocal collision_returned
+        if not collision_returned:
+            collision_returned = True
+            return first["filename"]
+        return real_final_name(now)
+
+    monkeypatch.setattr(backup_module, "_final_name", candidate)
+    resp = client_post(backup_client, BACKUP_TOKEN)
+    assert resp.status_code == 201, resp.text
+    second = resp.json()
+
+    # 新备份以另一个名字发布；旧备份的文件名与内容原样保留
+    assert second["filename"] != first["filename"]
+    assert first_path.is_file()
+    assert first_path.read_bytes() == first_bytes
+    second_path = bdir / second["filename"]
+    assert second_path.is_file()
+    assert second["size_bytes"] == second_path.stat().st_size
+    assert second["sha256"] == hashlib.sha256(second_path.read_bytes()).hexdigest()
+    assert sorted(p.name for p in bdir.glob("*.db")) == sorted(
+        [first["filename"], second["filename"]]
+    )
+    # 无临时文件残留
+    assert not [p for p in bdir.iterdir() if p.name.startswith(".intermod-backup-")]
+
+
+def test_failed_backup_only_cleans_its_own_tmp(backup_client, monkeypatch):
+    from pathlib import Path
+
+    from app import backup as backup_module
+
+    _seed_site(backup_client)
+    good = client_post(backup_client, BACKUP_TOKEN).json()
+    bdir = Path(os.environ["IMD_BACKUP_DIR"])
+    good_path = bdir / good["filename"]
+    good_bytes = good_path.read_bytes()  # 其他请求已发布的备份
+
+    def boom(source_path, target_path):
+        # 模拟复制中途失败：本次临时文件已写入部分内容
+        Path(target_path).write_bytes(b"partial backup bytes")
+        raise backup_module.BackupError("simulated copy failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backup_module, "_online_copy", boom)
+        resp = client_post(backup_client, BACKUP_TOKEN)
+    assert resp.status_code == 500
+    # 只清理本次临时文件：既有备份内容不变、仍在原位，目录下无其他残留
+    assert good_path.is_file()
+    assert good_path.read_bytes() == good_bytes
+    assert [p.name for p in bdir.iterdir()] == [good["filename"]]
+
+
+def test_concurrent_backups_with_colliding_names_never_overwrite(
+    backup_client, monkeypatch
+):
+    import hashlib
+    from pathlib import Path
+
+    from app import backup as backup_module
+
+    _seed_site(backup_client)
+
+    # 所有线程的第一次发布候选强制同名：恰好一个线程抢占成功，其余线程必须
+    # 靠 os.link 的 FileExistsError 检测换名重试，各自发布到独立文件。
+    real_final_name = backup_module._final_name
+    colliding_name = "intermod-20260101T000000-deadbeef.db"
+    claimed: set[int] = set()
+    name_lock = threading.Lock()
+
+    def candidate(now=None):
+        tid = threading.get_ident()
+        with name_lock:
+            first_attempt = tid not in claimed
+            claimed.add(tid)
+        if first_attempt:
+            return colliding_name
+        return real_final_name(now)
+
+    monkeypatch.setattr(backup_module, "_final_name", candidate)
+
+    n = 8
+    results: list[dict | BaseException] = [None] * n  # type: ignore[assignment]
+
+    def worker(i: int) -> None:
+        try:
+            results[i] = backup_module.create_backup()
+        except BaseException as exc:  # noqa: BLE001 - 测试中记录线程内任何失败
+            results[i] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    bodies = [r for r in results if isinstance(r, dict)]
+    assert len(bodies) == n, results
+    names = [b["filename"] for b in bodies]
+    assert len(set(names)) == n  # 每个请求实际发布的文件名互不相同
+    assert colliding_name in names  # 恰有一个请求赢得撞名候选
+
+    bdir = Path(os.environ["IMD_BACKUP_DIR"])
+    for body in bodies:
+        path = bdir / body["filename"]
+        assert path.is_file()
+        assert path.stat().st_size == body["size_bytes"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == body["sha256"]
+    # 8 份最终备份并存，无临时文件残留
+    assert len(list(bdir.glob("*.db"))) == n
+    assert not [p for p in bdir.iterdir() if p.name.startswith(".intermod-backup-")]
 
 
 def test_backup_rejects_memory_database(monkeypatch, tmp_path):
