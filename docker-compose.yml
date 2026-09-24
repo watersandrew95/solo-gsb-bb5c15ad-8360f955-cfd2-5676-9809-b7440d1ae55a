@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    image: rf-intermod-api
+    ports:
+      - "8000:8000"
+    environment:
+      IMD_DB_PATH: /data/intermod.db
+      IMD_BACKUP_DIR: /data/backups
+      # 备份令牌：在同目录 .env 中设置 IMD_BACKUP_TOKEN=...（docker compose 自动加载）；
+      # 未配置（缺失或为空）时 POST /maintenance/backups 一律返回 503 拒绝备份。
+      IMD_BACKUP_TOKEN: ${IMD_BACKUP_TOKEN:-}
+    volumes:
+      - imd-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  imd-data:
